@@ -82,7 +82,7 @@ impl Context {
     }
     fn new(func: Entry, stack_size: usize, id: u64) -> Self {
         let layout = Layout::from_size_align(stack_size, PAGE_SIZE).unwrap();
-        let stack = unsafe { alloc(layout) } as *mut u8;
+        let stack = unsafe { alloc(layout) };
 
         unsafe {
             mprotect(stack as *mut c_void, PAGE_SIZE, ProtFlags::PROT_NONE).unwrap();
@@ -119,7 +119,6 @@ impl<T> MappedList<T> {
             self.map.insert(id, list);
         }
     }
-
     fn pop_front(&mut self, id: u64) -> Option<T> {
         if let Some(list) = self.map.get_mut(&id) {
             list.pop_front()
@@ -144,9 +143,46 @@ static mut CONTEXTS: LinkedList<Box<Context>> = LinkedList::new();
 // Set of Thread IDs
 static mut ID: *mut HashSet<u64> = ptr::null_mut();
 
+// Use these for actor model implementation
+
+// Message Queue
 static mut MESSAGES: *mut MappedList<u64> = ptr::null_mut();
 
+// Waiting Queue
 static mut WAITING: *mut HashMap<u64, Box<Context>> = ptr::null_mut();
+
+pub fn send(key: u64, msg: u64) {
+    unsafe {
+        (*MESSAGES).push_back(key, msg);
+        if let Some(ctx) = (*WAITING).remove(&key) {
+            CONTEXTS.push_back(ctx);
+        }
+    }
+    schedule();
+}
+
+pub fn recv() -> Option<u64> {
+    unsafe {
+        let key = CONTEXTS.front()?.id;
+        if let Some(msg) = (*MESSAGES).pop_front(key) {
+            return Some(msg);
+        }
+        if CONTEXTS.len() == 1 {
+            panic!("dead lock!");
+        }
+
+        let mut ctx = CONTEXTS.pop_front().unwrap();
+        let regs = ctx.get_regs_mut();
+        (*WAITING).insert(key, ctx);
+
+        if set_context(regs) == 0 {
+            let next = CONTEXTS.front().unwrap();
+            switch_context((**next).get_regs());
+        }
+        rm_unused_stack();
+        (*MESSAGES).pop_front(key)
+    }
+}
 
 fn get_id() -> u64 {
     loop {
@@ -199,7 +235,7 @@ extern "C" fn entry_point() {
     unsafe {
         // execute the designated function
         let ctx = CONTEXTS.front().unwrap();
-        ((**ctx).entry)();
+        (ctx.entry)();
 
         // below will be executed when the threads are finished
 
@@ -208,7 +244,7 @@ extern "C" fn entry_point() {
 
         (*ID).remove(&ctx.id);
 
-        UNUSED_STACK = ((*ctx).stack, (*ctx).stack_layout);
+        UNUSED_STACK = (ctx.stack, ctx.stack_layout);
 
         match CONTEXTS.front() {
             Some(next) => {
